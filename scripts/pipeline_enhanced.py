@@ -1410,7 +1410,7 @@ class VideoAnalysisPipeline:
         return scene_info
 
     def _step_transcription(self) -> Dict:
-        print("\n🎤 Step 4: 智能字幕提取 (B站API → 内嵌 → RapidOCR → FunASR)...")
+        print("\n🎤 Step 4: 智能字幕提取 (B站API → 内嵌 → RapidOCR → Qwen3-ASR)...")
         if self.srt_path.exists():
             print(f"   ⚠️  Transcription already exists: {self.srt_path}")
             self.results["steps_completed"].append("transcription")

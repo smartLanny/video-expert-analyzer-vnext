@@ -36,6 +36,10 @@ TRUSTED_SUBTITLE_MODES = {
 
 FUNASR_NANO_MODEL_ID = "FunAudioLLM/Fun-ASR-Nano-2512"
 FUNASR_FALLBACK_MODEL_ID = "paraformer-zh"
+QWEN3_ASR_ROOT = Path(os.environ.get("QWEN3_ASR_ROOT", "/Users/lann/Desktop/videouse/video-use"))
+QWEN3_ASR_PYTHON = Path(os.environ.get("QWEN3_ASR_PYTHON", str(QWEN3_ASR_ROOT / ".venv" / "bin" / "python")))
+QWEN3_ASR_HELPER = Path(os.environ.get("QWEN3_ASR_HELPER", str(QWEN3_ASR_ROOT / "helpers" / "transcribe.py")))
+LAST_ASR_MODE = ""
 
 
 def choose_subtitle_strategy(title: str = "", url: str = "") -> str:
@@ -719,6 +723,95 @@ def _write_segments_to_srt(segments: list[dict], output_srt: str) -> int:
     return subtitle_count
 
 
+def _scribe_words_to_segments(words: list[dict]) -> list[dict]:
+    segments: list[dict] = []
+    current_text: list[str] = []
+    current_start: float | None = None
+    current_end: float | None = None
+    previous_end: float | None = None
+    sentence_endings = set("。！？!?；;…")
+    clause_breaks = set("，,、")
+
+    def flush() -> None:
+        nonlocal current_text, current_start, current_end
+        text = "".join(current_text).strip()
+        if text and current_start is not None and current_end is not None and current_end > current_start:
+            segments.append({"text": text, "start": current_start, "end": current_end})
+        current_text = []
+        current_start = None
+        current_end = None
+
+    for item in words:
+        if item.get("type") != "word":
+            continue
+        raw_text = str(item.get("text", ""))
+        if not raw_text.strip():
+            continue
+        start = float(item.get("start", 0.0))
+        end = float(item.get("end", start))
+        if previous_end is not None and start - previous_end > 0.85:
+            flush()
+        if current_start is None:
+            current_start = start
+        current_text.append(raw_text)
+        current_end = max(current_end or end, end)
+        previous_end = end
+
+        joined = "".join(current_text)
+        should_flush = raw_text[-1] in sentence_endings
+        should_flush = should_flush or (raw_text[-1] in clause_breaks and len(joined) >= 28)
+        should_flush = should_flush or len(joined) >= 42
+        if should_flush:
+            flush()
+
+    flush()
+    return segments
+
+
+def extract_with_qwen3_asr(video_path: str, output_srt: str, *, title: str = "", url: str = "") -> bool:
+    """使用本机 video-use 链路中的 Qwen3-ASR 转写，并转换为 SRT。"""
+    if not QWEN3_ASR_PYTHON.exists() or not QWEN3_ASR_HELPER.exists():
+        print("❌ 本地 Qwen3-ASR 链路不可用")
+        print(f"   Python: {QWEN3_ASR_PYTHON}")
+        print(f"   Helper: {QWEN3_ASR_HELPER}")
+        return False
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            edit_dir = Path(tmpdir) / "edit"
+            cmd = [
+                str(QWEN3_ASR_PYTHON),
+                str(QWEN3_ASR_HELPER),
+                video_path,
+                "--edit-dir",
+                str(edit_dir),
+            ]
+            if "zh" in _guess_language_candidates(title, url):
+                cmd.extend(["--language", "zh"])
+
+            print("🎤 使用本地 Qwen3-ASR 进行语音转录...")
+            print(f"   Runtime: {QWEN3_ASR_PYTHON}")
+            print("   ASR 模型: Qwen/Qwen3-ASR-1.7B")
+            print("   Aligner: Qwen/Qwen3-ForcedAligner-0.6B")
+            subprocess.run(cmd, check=True, cwd=str(QWEN3_ASR_ROOT))
+
+            transcript_path = edit_dir / "transcripts" / f"{Path(video_path).stem}.json"
+            payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+            segments = _scribe_words_to_segments(payload.get("words") or [])
+            if transcript_quality_is_poor(segments):
+                print("❌ Qwen3-ASR 转录质量过低，放弃写入主字幕")
+                return False
+
+            subtitle_count = _write_segments_to_srt(segments, output_srt)
+            print(f"✅ Qwen3-ASR 转录完成: {subtitle_count} 条字幕")
+            global LAST_ASR_MODE
+            LAST_ASR_MODE = "qwen3_asr"
+            return subtitle_count > 0
+    except Exception as e:
+        print(f"❌ Qwen3-ASR 转录失败: {e}")
+        return False
+
+
 def extract_with_whisper_mlx(video_path: str, output_srt: str, *, title: str = "", url: str = "") -> bool:
     """
     使用 MLX Whisper 进行语音转录 (macOS 专用)
@@ -772,6 +865,8 @@ def extract_with_whisper_mlx(video_path: str, output_srt: str, *, title: str = "
         os.unlink(audio_path)
 
         print(f"✅ MLX Whisper 转录完成: {subtitle_count} 条字幕")
+        global LAST_ASR_MODE
+        LAST_ASR_MODE = "mlx_whisper"
         return subtitle_count > 0
 
     except ImportError:
@@ -863,6 +958,8 @@ def extract_with_funasr(video_path: str, output_srt: str) -> bool:
         os.unlink(audio_path)
 
         print(f"✅ FunASR 转录完成: {subtitle_count} 条字幕")
+        global LAST_ASR_MODE
+        LAST_ASR_MODE = "funasr"
         return subtitle_count > 0
 
     except ImportError:
@@ -879,12 +976,17 @@ def extract_with_funasr(video_path: str, output_srt: str) -> bool:
 def extract_with_smart_asr(video_path: str, output_srt: str, *, title: str = "", url: str = "") -> bool:
     """
     智能选择 ASR 引擎
-    - macOS: 使用 MLX Whisper (Apple Silicon 优化)
-    - Windows/Linux: 使用 FunASR (通用高性能)
+    - 优先使用本机 Qwen3-ASR
+    - Qwen3-ASR 不可用时回退到旧链路
     """
     system = platform.system()
 
     print(f"检测到系统: {system}")
+    print("→ 优先使用本地 Qwen3-ASR")
+    if extract_with_qwen3_asr(video_path, output_srt, title=title, url=url):
+        return True
+
+    print("\n⚠️  Qwen3-ASR 不可用，回退到旧 ASR 链路...")
 
     if system == "Darwin":  # macOS
         print("→ 使用 MLX Whisper (Apple Silicon 优化)")
@@ -970,7 +1072,7 @@ def smart_subtitle_extraction(video_path: str, output_srt: str, video_url: str =
                 print("✅ 检测到画面文字，额外写入 onscreen_text 轨道...")
                 extract_burned_subtitle_ocr(video_path, onscreen_srt)
         system = platform.system()
-        mode = "mlx_whisper" if system == "Darwin" else "funasr"
+        mode = LAST_ASR_MODE or ("mlx_whisper" if system == "Darwin" else "funasr")
         return _return_success(mode)
 
     if strategy != "music_first":
